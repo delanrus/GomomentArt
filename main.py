@@ -1,19 +1,14 @@
-import os
 import asyncio
 import base64
-
+import os
 from aiogram import Bot, Dispatcher, F
-from aiogram.types import (
-    Message,
-    ReplyKeyboardMarkup,
-    KeyboardButton,
-    ReplyKeyboardRemove
-)
-from aiogram.fsm.storage.memory import MemoryStorage
-from aiogram.fsm.state import State, StatesGroup
+from aiogram.types import Message, ReplyKeyboardMarkup, KeyboardButton, FSInputFile
+from aiogram.filters import Command
+from aiogram.fsm.state import StatesGroup, State
 from aiogram.fsm.context import FSMContext
-from dotenv import load_dotenv
+from aiogram.fsm.storage.memory import MemoryStorage
 from openai import OpenAI
+from dotenv import load_dotenv
 
 load_dotenv()
 
@@ -24,104 +19,152 @@ bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher(storage=MemoryStorage())
 client = OpenAI(api_key=OPENAI_API_KEY)
 
-class PostcardState(StatesGroup):
+# =======================
+# Состояния
+# =======================
+
+class CardState(StatesGroup):
     waiting_for_photo = State()
     waiting_for_holiday = State()
     waiting_for_phrase = State()
 
-PROMPTS = {
-    "8_march": """
-Сделай открытку из этого фото. Сохрани черты лица и позу.
-Открытка должна быть посвящена 8 марта с текстом [{phrase}] и [С 8 марта!].
-Открытка сделана в стиле:
-A bold editorial fashion illustration rendered in thick oil pastel or wax crayon,
-with chunky, textured strokes on visible sketchbook paper. It should feel chic and modern, focusing on outfit and pose through expressive color blocks rather than outlines or realism. Формат 4:3
-""",
-    "birthday": """
-Сделай открытку из этого фото. Сохрани черты лица и позу.
-Открытка должна быть посвящена Дню рождения с текстом [{phrase}] и [С Днём рождения!].
-Открытка сделана в стиле:
-A bold editorial fashion illustration rendered in thick oil pastel or wax crayon,
-with chunky, textured strokes on visible sketchbook paper. It should feel chic and modern, focusing on outfit and pose through expressive color blocks rather than outlines or realism. Формат 4:3
-""",
-    "23_feb": """
-Сделай открытку из этого фото. Сохрани черты лица и позу.
-Открытка должна быть посвящена 23 февраля с текстом [{phrase}] и [С Днем Защитника Отечества!].
-Открытка сделана в стиле:
-A bold editorial fashion illustration rendered in thick oil pastel or wax crayon,
-with chunky, textured strokes on visible sketchbook paper. It should feel chic and modern, focusing on outfit and pose through expressive color blocks rather than outlines or realism. Формат 4:3
-"""
-}
+# =======================
+# /start
+# =======================
 
-@dp.message(F.text == "/start")
-async def start(message: Message, state: FSMContext):
-    await state.set_state(PostcardState.waiting_for_photo)
-    await message.answer("Привет 👋 Отправь фото для открытки.")
+@dp.message(Command("start"))
+async def start_handler(message: Message, state: FSMContext):
+    await state.clear()
 
-@dp.message(PostcardState.waiting_for_photo, F.photo)
-async def handle_photo(message: Message, state: FSMContext):
+    text = (
+        "Привет. Меня зовут Руслан и я помогу вам создать персональную открытку по вашей фотографии!\n\n"
+        "Идея простая:\n"
+        "Вы присылаете фото — я превращаю его в стильную праздничную открытку.\n\n"
+        "К 8 марта\n"
+        "Ко дню рождения\n"
+        "И к любому другому празднику.\n\n"
+        "Присылай скорее фотографию того, кого хочешь поздравить!"
+    )
+
+    await message.answer_photo(
+        photo="https://images.unsplash.com/photo-1511988617509-a57c8a288659",
+        caption=text
+    )
+
+    await state.set_state(CardState.waiting_for_photo)
+
+# =======================
+# Получение фото
+# =======================
+
+@dp.message(CardState.waiting_for_photo, F.photo)
+async def get_photo(message: Message, state: FSMContext):
     photo = message.photo[-1]
-    file = await bot.get_file(photo.file_id)
-    downloaded = await bot.download_file(file.file_path)
-
-    await state.update_data(photo=downloaded.read())
-    await state.set_state(PostcardState.waiting_for_holiday)
+    await state.update_data(photo_file_id=photo.file_id)
 
     keyboard = ReplyKeyboardMarkup(
         keyboard=[
             [KeyboardButton(text="8 марта")],
             [KeyboardButton(text="День рождения")],
-            [KeyboardButton(text="23 февраля")]
+            [KeyboardButton(text="Другой праздник")]
         ],
         resize_keyboard=True
     )
 
     await message.answer("Выбери праздник:", reply_markup=keyboard)
+    await state.set_state(CardState.waiting_for_holiday)
 
-@dp.message(PostcardState.waiting_for_holiday)
+# =======================
+# Выбор праздника
+# =======================
+
+@dp.message(CardState.waiting_for_holiday)
 async def choose_holiday(message: Message, state: FSMContext):
+    await state.update_data(holiday=message.text)
 
-    holiday_map = {
-        "8 марта": "8_march",
-        "День рождения": "birthday",
-        "23 февраля": "23_feb"
-    }
+    # удаляем сообщение с кнопкой
+    await message.delete()
 
-    if message.text not in holiday_map:
-        await message.answer("Выбери праздник кнопкой.")
-        return
+    await message.answer("Напиши фразу для открытки (до 100 символов):")
+    await state.set_state(CardState.waiting_for_phrase)
 
-    await state.update_data(holiday=holiday_map[message.text])
-    await state.set_state(PostcardState.waiting_for_phrase)
+# =======================
+# Генерация открытки
+# =======================
 
-    await message.answer(
-        "Напиши фразу для открытки (до 100 символов)",
-        reply_markup=ReplyKeyboardRemove()
-    )
-
-@dp.message(PostcardState.waiting_for_phrase)
-async def generate_postcard(message: Message, state: FSMContext):
+@dp.message(CardState.waiting_for_phrase)
+async def generate_card(message: Message, state: FSMContext):
+    user_phrase = message.text[:100]
     data = await state.get_data()
+    holiday = data["holiday"]
+    file_id = data["photo_file_id"]
 
-    phrase = message.text.strip()[:100]
-    prompt_template = PROMPTS[data["holiday"]]
-    prompt = prompt_template.format(phrase=phrase)
+    await message.delete()
 
-    await message.answer("Создаю открытку... ⏳")
+    wait_msg = await message.answer("Создаю открытку ⏳")
 
-    response = client.images.generate(
-        model="gpt-image-1",
-        prompt=prompt,
-        image=data["photo"],
-        size="1024x1536"
-    )
+    # Анимация ожидания
+    async def loading_animation():
+        emojis = ["⏳", "⌛", "🕐", "🕑", "🕒"]
+        i = 0
+        while True:
+            try:
+                await wait_msg.edit_text(f"Создаю открытку {emojis[i % len(emojis)]}")
+                i += 1
+                await asyncio.sleep(1)
+            except:
+                break
 
-    image_base64 = response.data[0].b64_json
-    result = base64.b64decode(image_base64)
+    animation_task = asyncio.create_task(loading_animation())
 
-    await message.answer_photo(result)
+    try:
+        file = await bot.get_file(file_id)
+        photo_bytes = await bot.download_file(file.file_path)
+        photo_content = photo_bytes.read()
+
+        prompt = f"""
+Сделай открытку из этого фото.
+Сохрани черты лица и позу.
+
+Открытка должна быть посвящена {holiday}
+с текстом "{user_phrase}"
+и "С {holiday}"
+
+Стиль:
+A bold editorial fashion illustration rendered in thick oil pastel
+with chunky textured strokes on sketchbook paper.
+Chic and modern.
+Формат 3:4
+"""
+
+        result = client.images.generate(
+            model="gpt-image-1",
+            prompt=prompt,
+            size="1024x1792"
+        )
+
+        image_base64 = result.data[0].b64_json
+        image_bytes = base64.b64decode(image_base64)
+
+        with open("result.png", "wb") as f:
+            f.write(image_bytes)
+
+        animation_task.cancel()
+        await wait_msg.delete()
+
+        await message.answer_photo(
+            photo=FSInputFile("result.png"),
+            caption="Готово 🎉"
+        )
+
+    except Exception as e:
+        animation_task.cancel()
+        await wait_msg.edit_text("Ошибка генерации 😔 Попробуйте позже.")
+        print(e)
 
     await state.clear()
+
+# =======================
 
 async def main():
     await dp.start_polling(bot)
